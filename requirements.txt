@@ -1,0 +1,6 @@
+streamlit
+exif
+simplekml
+folium
+streamlit-folium
+pandas
