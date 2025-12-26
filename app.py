@@ -53,14 +53,16 @@ def dd_to_gms(decimal, is_lat):
     return f"{d}°{m}'{s}\"{dir}"
 
 def get_road_route(points):
-    if len(points) &lt; 2: return points
+    if len(points) &lt; 2: 
+        return points
     coords = ";".join([f"{p[1]},{p[0]}" for p in points])
     url = f"http://router.project-osrm.org/route/v1/driving/{coords}?overview=full&geometries=geojson"
     try:
         r = requests.get(url, timeout=10).json()
         if r.get("code") == "Ok":
             return [[c[1], c[0]] for c in r["routes"][0]["geometry"]["coordinates"]]
-    except: pass
+    except: 
+        pass
     return points
 
 # --- INTERFACE ---
@@ -88,7 +90,8 @@ if uploaded_files:
                     "Arquivo": file.name, "Lat": lat, "Lon": lon, "Time": dt_obj,
                     "GMS": f"{dd_to_gms(lat, True)}, {dd_to_gms(lon, False)}"
                 })
-        except: continue
+        except: 
+            continue
 
     if raw_data:
         # 1. Ordenação e Filtragem com Ponto Final Obrigatório
@@ -133,8 +136,10 @@ if uploaded_files:
             
             # Gerar Excel
             output_excel = io.BytesIO()
+            df_excel = df_f[['Arquivo', 'Time', 'GMS', 'Dist_Parcial_m', 'KM_Trecho']].copy()
+            df_excel.columns = ['Arquivo', 'Data_Hora', 'Coordenadas_GMS', 'Dist_Parcial_Metros', 'KM_Acumulado']
             with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                df_f.to_excel(writer, index=False, sheet_name='Relatorio_Vistoria')
+                df_excel.to_excel(writer, index=False, sheet_name='Relatorio_Vistoria')
             st.download_button("📊 Baixar Relatório Excel", output_excel.getvalue(), "relatorio_vistoria.xlsx")
 
             # Gerar KML
@@ -170,6 +175,7 @@ if uploaded_files:
                 os.unlink(tmp.name)
 
         with col_map:
+            st.subheader("🗺️ Mapa do Trecho")
             m = folium.Map(location=[df_f['Lat'].mean(), df_f['Lon'].mean()], zoom_start=13, tiles="cartodbpositron")
             folium.PolyLine(rota_kml, color="#007bff", weight=4).add_to(m)
             for i, row in df_f.iterrows():
