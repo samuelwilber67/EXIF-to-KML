@@ -10,10 +10,10 @@ import tempfile
 import os
 
 # Configuração da página
-st.set_page_config(page_title="GeoPhoto Pro - Ministério da Agricultura", layout="wide")
+st.set_page_config(page_title="GeoPhoto Pro 5km - Ministério da Agricultura", layout="wide")
 
-st.title("📍 Levantamento Fotográfico Georreferenciado")
-st.markdown("Ferramenta otimizada para criação de trajetos e redução de densidade de pontos.")
+st.title("📍 Levantamento Fotográfico de Grande Escala")
+st.markdown("Filtro de densidade expandido para até 5km e nomenclatura em GMS.")
 
 def dms_to_dd(dms, ref):
     degrees = dms[0]
@@ -24,10 +24,31 @@ def dms_to_dd(dms, ref):
         dd = -dd
     return dd
 
-# Barra Lateral de Configurações
+def dd_to_gms(decimal, is_lat):
+    """Converte Graus Decimais para a string formatada em Graus, Minutos e Segundos."""
+    abs_decimal = abs(decimal)
+    degrees = int(abs_decimal)
+    minutes_full = (abs_decimal - degrees) * 60
+    minutes = int(minutes_full)
+    seconds = round((minutes_full - minutes) * 60, 2)
+    
+    if is_lat:
+        direction = 'N' if decimal >= 0 else 'S'
+    else:
+        direction = 'E' if decimal >= 0 else 'W'
+        
+    return f"{degrees}°{minutes}'{seconds}\"{direction}"
+
+# Barra Lateral de Configurações - AMPLIADA PARA 5KM
 st.sidebar.header("Configurações de Filtro")
-raio_minimo = st.sidebar.slider("Raio de distância mínima entre pontos (metros)", 0, 500, 10, 
-                               help="Pontos dentro deste raio em relação ao ponto anterior serão descartados para reduzir o tamanho do arquivo.")
+raio_minimo = st.sidebar.slider(
+    "Distância mínima entre pontos (metros)", 
+    min_value=0, 
+    max_value=5000, # Limite expandido para 5km
+    value=100,      # Valor padrão inicial
+    step=50,        # Passo de 50m para facilitar ajuste em grandes escalas
+    help="Pontos capturados a uma distância menor que esta em relação ao ponto anterior serão descartados."
+)
 
 uploaded_files = st.file_uploader("Carregue as fotos do levantamento", type=['jpg', 'jpeg'], accept_multiple_files=True)
 
@@ -41,25 +62,27 @@ if uploaded_files:
                 lat = dms_to_dd(img.gps_latitude, img.gps_latitude_ref)
                 lon = dms_to_dd(img.gps_longitude, img.gps_longitude_ref)
                 
-                # Extração da data/hora original
                 dt_str = getattr(img, 'datetime_original', None)
                 dt_obj = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S') if dt_str else datetime.fromtimestamp(file.last_modified)
+                
+                # Gerar nome em GMS
+                nome_gms = f"{dd_to_gms(lat, True)}, {dd_to_gms(lon, False)}"
                 
                 raw_data.append({
                     "Arquivo": file.name,
                     "Latitude": lat,
                     "Longitude": lon,
                     "Timestamp": dt_obj,
-                    "Coord_Nome": f"{round(lat, 6)}, {round(lon, 6)}"
+                    "Coord_GMS": nome_gms
                 })
         except Exception as e:
             st.error(f"Erro no arquivo {file.name}: {e}")
 
     if raw_data:
-        # 1. Ordenação Cronológica (Critério de Data e Horário)
+        # Ordenação Cronológica Obrigatória
         df_full = pd.DataFrame(raw_data).sort_values(by='Timestamp')
         
-        # 2. Lógica de Filtragem por Raio (Distância)
+        # Lógica de Filtragem Espacial
         filtered_points = []
         if not df_full.empty:
             last_kept_point = df_full.iloc[0]
@@ -78,50 +101,49 @@ if uploaded_files:
 
         df_filtered = pd.DataFrame(filtered_points)
         
-        # Exibição de métricas
-        st.info(f"Original: {len(df_full)} pontos | Otimizado: {len(df_filtered)} pontos (Redução de {100 - (len(df_filtered)/len(df_full)*100):.1f}%)")
+        # Métricas de Otimização
+        st.info(f"📊 Resumo: {len(df_full)} fotos processadas ➔ {len(df_filtered)} pontos no KML.")
 
         col1, col2 = st.columns([1, 2])
         
         with col1:
-            st.subheader("Pontos do Trajeto")
-            st.dataframe(df_filtered[['Timestamp', 'Coord_Nome']], use_container_width=True)
+            st.subheader("Dados do Trajeto")
+            st.dataframe(df_filtered[['Timestamp', 'Coord_GMS']], use_container_width=True)
             
             # Geração do KML
             kml = simplekml.Kml()
-            
-            # Criar os pontos (Nome = Coordenada)
             coords_list = []
+            
             for _, row in df_filtered.iterrows():
-                pnt = kml.newpoint(name=row['Coord_Nome'], coords=[(row['Longitude'], row['Latitude'])])
-                pnt.description = f"Arquivo: {row['Arquivo']}\nData: {row['Timestamp']}"
+                # Nome do ponto = Coordenada GMS
+                pnt = kml.newpoint(name=row['Coord_GMS'], coords=[(row['Longitude'], row['Latitude'])])
+                pnt.description = f"Foto: {row['Arquivo']}\nData: {row['Timestamp'].strftime('%d/%m/%Y %H:%M:%S')}"
                 coords_list.append((row['Longitude'], row['Latitude']))
             
-            # Criar o Caminho (LineString) entre o primeiro e o último
+            # Linha de trajeto
             if len(coords_list) > 1:
-                lin = kml.newlinestring(name="Trajeto Cronológico", coords=coords_list)
-                lin.style.linestyle.color = simplekml.Color.red
-                lin.style.linestyle.width = 3
+                lin = kml.newlinestring(name="Caminho do Levantamento", coords=coords_list)
+                lin.style.linestyle.color = simplekml.Color.cyan
+                lin.style.linestyle.width = 5
 
             with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
                 kml.save(tmp.name)
                 with open(tmp.name, 'rb') as f:
-                    st.download_button("💾 Baixar KML Otimizado", f, "trajeto_campo.kml")
+                    st.download_button("💾 Baixar KML (GMS + Trajeto)", f, "levantamento_otimizado.kml")
                 os.unlink(tmp.name)
 
         with col2:
-            st.subheader("Mapa de Campo")
-            m = folium.Map(location=[df_filtered['Latitude'].mean(), df_filtered['Longitude'].mean()], zoom_start=14)
+            st.subheader("Visualização Espacial")
+            # Centraliza o mapa na média dos pontos filtrados
+            m = folium.Map(location=[df_filtered['Latitude'].mean(), df_filtered['Longitude'].mean()], zoom_start=13)
             
-            # Desenhar linha no mapa
-            folium.PolyLine(df_filtered[['Latitude', 'Longitude']].values, color="red", weight=2.5, opacity=1).add_to(m)
+            # Desenha o trajeto no mapa interativo
+            folium.PolyLine(df_filtered[['Latitude', 'Longitude']].values, color="cyan", weight=4, opacity=0.8).add_to(m)
             
             for _, row in df_filtered.iterrows():
-                folium.CircleMarker(
+                folium.Marker(
                     [row['Latitude'], row['Longitude']],
-                    radius=5,
-                    color='blue',
-                    fill=True,
-                    popup=f"Hora: {row['Timestamp'].strftime('%H:%M:%S')}\nCoord: {row['Coord_Nome']}"
+                    popup=f"<b>Coordenada:</b><br>{row['Coord_GMS']}<br><b>Hora:</b> {row['Timestamp'].strftime('%H:%M:%S')}",
+                    icon=folium.Icon(color='blue', icon='camera')
                 ).add_to(m)
             folium_static(m)
