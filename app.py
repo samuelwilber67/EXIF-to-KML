@@ -4,17 +4,16 @@ import simplekml
 import folium
 from streamlit_folium import folium_static
 import pandas as pd
+from datetime import datetime
+from geopy.distance import geodesic
 import tempfile
 import os
 
 # Configuração da página
-st.set_page_config(page_title="Photo EXIF to KML", layout="wide")
+st.set_page_config(page_title="GeoPhoto Pro - Ministério da Agricultura", layout="wide")
 
-st.title("📍 Conversor de Fotos EXIF para KML")
-st.markdown("""
-Esta ferramenta extrai coordenadas GPS de suas fotos e gera um arquivo KML para uso em softwares de engenharia e SIG.
-**Privacidade:** Suas fotos são processadas localmente e não são armazenadas no servidor.
-""")
+st.title("📍 Levantamento Fotográfico Georreferenciado")
+st.markdown("Ferramenta otimizada para criação de trajetos e redução de densidade de pontos.")
 
 def dms_to_dd(dms, ref):
     degrees = dms[0]
@@ -25,10 +24,15 @@ def dms_to_dd(dms, ref):
         dd = -dd
     return dd
 
-uploaded_files = st.file_uploader("Arraste suas fotos (JPG/JPEG) aqui", type=['jpg', 'jpeg'], accept_multiple_files=True)
+# Barra Lateral de Configurações
+st.sidebar.header("Configurações de Filtro")
+raio_minimo = st.sidebar.slider("Raio de distância mínima entre pontos (metros)", 0, 500, 10, 
+                               help="Pontos dentro deste raio em relação ao ponto anterior serão descartados para reduzir o tamanho do arquivo.")
+
+uploaded_files = st.file_uploader("Carregue as fotos do levantamento", type=['jpg', 'jpeg'], accept_multiple_files=True)
 
 if uploaded_files:
-    data_list = []
+    raw_data = []
     
     for file in uploaded_files:
         try:
@@ -37,50 +41,87 @@ if uploaded_files:
                 lat = dms_to_dd(img.gps_latitude, img.gps_latitude_ref)
                 lon = dms_to_dd(img.gps_longitude, img.gps_longitude_ref)
                 
-                data_list.append({
+                # Extração da data/hora original
+                dt_str = getattr(img, 'datetime_original', None)
+                dt_obj = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S') if dt_str else datetime.fromtimestamp(file.last_modified)
+                
+                raw_data.append({
                     "Arquivo": file.name,
-                    "Latitude": round(lat, 6),
-                    "Longitude": round(lon, 6)
+                    "Latitude": lat,
+                    "Longitude": lon,
+                    "Timestamp": dt_obj,
+                    "Coord_Nome": f"{round(lat, 6)}, {round(lon, 6)}"
                 })
-            else:
-                st.warning(f"⚠️ {file.name}: Sem dados de GPS encontrados.")
         except Exception as e:
-            st.error(f"❌ Erro ao processar {file.name}: {e}")
+            st.error(f"Erro no arquivo {file.name}: {e}")
 
-    if data_list:
-        df = pd.DataFrame(data_list)
+    if raw_data:
+        # 1. Ordenação Cronológica (Critério de Data e Horário)
+        df_full = pd.DataFrame(raw_data).sort_values(by='Timestamp')
         
+        # 2. Lógica de Filtragem por Raio (Distância)
+        filtered_points = []
+        if not df_full.empty:
+            last_kept_point = df_full.iloc[0]
+            filtered_points.append(last_kept_point)
+            
+            for i in range(1, len(df_full)):
+                current_point = df_full.iloc[i]
+                dist = geodesic(
+                    (last_kept_point['Latitude'], last_kept_point['Longitude']),
+                    (current_point['Latitude'], current_point['Longitude'])
+                ).meters
+                
+                if dist >= raio_minimo:
+                    filtered_points.append(current_point)
+                    last_kept_point = current_point
+
+        df_filtered = pd.DataFrame(filtered_points)
+        
+        # Exibição de métricas
+        st.info(f"Original: {len(df_full)} pontos | Otimizado: {len(df_filtered)} pontos (Redução de {100 - (len(df_filtered)/len(df_full)*100):.1f}%)")
+
         col1, col2 = st.columns([1, 2])
         
         with col1:
-            st.subheader("Dados Extraídos")
-            st.dataframe(df, use_container_width=True)
+            st.subheader("Pontos do Trajeto")
+            st.dataframe(df_filtered[['Timestamp', 'Coord_Nome']], use_container_width=True)
             
             # Geração do KML
             kml = simplekml.Kml()
-            for _, row in df.iterrows():
-                kml.newpoint(name=row['Arquivo'], coords=[(row['Longitude'], row['Latitude'])])
             
+            # Criar os pontos (Nome = Coordenada)
+            coords_list = []
+            for _, row in df_filtered.iterrows():
+                pnt = kml.newpoint(name=row['Coord_Nome'], coords=[(row['Longitude'], row['Latitude'])])
+                pnt.description = f"Arquivo: {row['Arquivo']}\nData: {row['Timestamp']}"
+                coords_list.append((row['Longitude'], row['Latitude']))
+            
+            # Criar o Caminho (LineString) entre o primeiro e o último
+            if len(coords_list) > 1:
+                lin = kml.newlinestring(name="Trajeto Cronológico", coords=coords_list)
+                lin.style.linestyle.color = simplekml.Color.red
+                lin.style.linestyle.width = 3
+
             with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
                 kml.save(tmp.name)
                 with open(tmp.name, 'rb') as f:
-                    st.download_button(
-                        label="💾 Baixar Arquivo KML",
-                        data=f,
-                        file_name="levantamento_fotos.kml",
-                        mime="application/vnd.google-earth.kml+xml"
-                    )
+                    st.download_button("💾 Baixar KML Otimizado", f, "trajeto_campo.kml")
                 os.unlink(tmp.name)
 
         with col2:
-            st.subheader("Visualização no Mapa")
-            m = folium.Map(location=[df['Latitude'].mean(), df['Longitude'].mean()], zoom_start=12)
-            for _, row in df.iterrows():
-                folium.Marker(
-                    [row['Latitude'], row['Longitude']], 
-                    popup=row['Arquivo'],
-                    tooltip=row['Arquivo']
+            st.subheader("Mapa de Campo")
+            m = folium.Map(location=[df_filtered['Latitude'].mean(), df_filtered['Longitude'].mean()], zoom_start=14)
+            
+            # Desenhar linha no mapa
+            folium.PolyLine(df_filtered[['Latitude', 'Longitude']].values, color="red", weight=2.5, opacity=1).add_to(m)
+            
+            for _, row in df_filtered.iterrows():
+                folium.CircleMarker(
+                    [row['Latitude'], row['Longitude']],
+                    radius=5,
+                    color='blue',
+                    fill=True,
+                    popup=f"Hora: {row['Timestamp'].strftime('%H:%M:%S')}\nCoord: {row['Coord_Nome']}"
                 ).add_to(m)
             folium_static(m)
-    else:
-        st.info("Aguardando upload de fotos com metadados de localização.")
