@@ -1,139 +1,177 @@
 import streamlit as st
-import pandas as pd
+from exif import Image
 import simplekml
-from geopy.geocoders import ArcGIS
-import time
-import re
+import folium
+from streamlit_folium import folium_static
+import pandas as pd
+from datetime import datetime
+from geopy.distance import geodesic
+import tempfile
+import os
+import requests
+import io
 
-# Configuração da interface
-st.set_page_config(page_title="MAPA - Filtro Regional", layout="wide")
-st.title("📍 Gestão Territorial de Convênios (Filtro por UF)")
-st.markdown("---")
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(
+    page_title="Vistoria KML Pro",
+    page_icon="📍",
+    layout="wide"
+)
 
-# Dicionário de Capitais para Alocação de Convênios Estaduais
-CAPITAIS = {
-    'AC': 'Rio Branco', 'AL': 'Maceió', 'AP': 'Macapá', 'AM': 'Manaus',
-    'BA': 'Salvador', 'CE': 'Fortaleza', 'DF': 'Brasília', 'ES': 'Vitória',
-    'GO': 'Goiânia', 'MA': 'São Luís', 'MT': 'Cuiabá', 'MS': 'Campo Grande',
-    'MG': 'Belo Horizonte', 'PA': 'Belém', 'PB': 'João Pessoa', 'PR': 'Curitiba',
-    'PE': 'Recife', 'PI': 'Teresina', 'RJ': 'Rio de Janeiro', 'RN': 'Natal',
-    'RS': 'Porto Alegre', 'RO': 'Porto Velho', 'RR': 'Boa Vista', 'SC': 'Florianópolis',
-    'SP': 'São Paulo', 'SE': 'Aracaju', 'TO': 'Palmas'
-}
-
-def detectar_colunas(colunas):
-    mapeamento = {}
-    padroes = {
-        'convenio': [r'conv[êe]nio', r'n[ºo]', r'numero', r'id'],
-        'municipio': [r'munic[íi]pio', r'cidade', r'localidade'],
-        'uf': [r'uf', r'estado', r'sigla'],
-        'percentual': [r'percentual', r'%', r'executado', r'execu[çc][ãa]o', r'fisico']
+# --- ESTILIZAÇÃO CUSTOMIZADA ---
+st.markdown("""
+    <style>
+    .main { background-color: #f8f9fa; }
+    .metric-card {
+        background-color: white;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        border-top: 4px solid #007bff;
+        text-align: center;
     }
-    for chave, regex_list in padroes.items():
-        for col in colunas:
-            for regex in regex_list:
-                if re.search(regex, col.lower()):
-                    mapeamento[chave] = col
-                    break
-            if chave in mapeamento: break
-    return mapeamento
+    .stDownloadButton > button {
+        width: 100%;
+        background-color: #28a745;
+        color: white;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-def limpar_nome(nome):
-    nome = str(nome).upper()
-    termos = ["MUNICIPIO DE ", "PREFEITURA DE ", "GOVERNO DE ", "PM DE ", "PREFEITURA MUNICIPAL DE "]
-    for termo in termos:
-        nome = nome.replace(termo, "")
-    return nome.strip()
+# --- FUNÇÕES TÉCNICAS ---
 
-def obter_estilo_execucao(valor):
-    """Lógica de cores: Azul (0%), Amarelo (0-80%), Vermelho (>80%)"""
+def dms_to_dd(dms, ref):
+    dd = dms[0] + (dms[1] / 60) + (dms[2] / 3600)
+    return -dd if ref in ['S', 'W'] else dd
+
+def dd_to_gms(decimal, is_lat):
+    abs_d = abs(decimal)
+    d = int(abs_d)
+    m = int((abs_d - d) * 60)
+    s = round((((abs_d - d) * 60) - m) * 60, 2)
+    dir = ('N' if decimal >= 0 else 'S') if is_lat else ('E' if decimal >= 0 else 'W')
+    return f"{d}°{m}'{s}\"{dir}"
+
+def get_road_route(points):
+    if len(points) &lt; 2: return points
+    coords = ";".join([f"{p[1]},{p[0]}" for p in points])
+    url = f"http://router.project-osrm.org/route/v1/driving/{coords}?overview=full&geometries=geojson"
     try:
-        v = float(str(valor).replace('%', '').replace(',', '.'))
-        if v > 1 and v <= 100: v = v / 100
+        r = requests.get(url, timeout=10).json()
+        if r.get("code") == "Ok":
+            return [[c[1], c[0]] for c in r["routes"][0]["geometry"]["coordinates"]]
+    except: pass
+    return points
+
+# --- INTERFACE ---
+st.title("📑 Geração de Arquivo KML a Partir das Fotos da Vistoria")
+
+with st.sidebar:
+    st.header("⚙️ Configurações")
+    raio_minimo = st.slider("Raio de Otimização (m)", 0, 5000, 100, 50)
+    seguir_estradas = st.toggle("Seguir estradas reais", value=True)
+    st.info("O último ponto da sequência é sempre incluído obrigatoriamente.")
+
+uploaded_files = st.file_uploader("Upload das fotos da vistoria", type=['jpg', 'jpeg'], accept_multiple_files=True)
+
+if uploaded_files:
+    raw_data = []
+    for file in uploaded_files:
+        try:
+            img = Image(file)
+            if img.has_exif and hasattr(img, 'gps_latitude'):
+                lat = dms_to_dd(img.gps_latitude, img.gps_latitude_ref)
+                lon = dms_to_dd(img.gps_longitude, img.gps_longitude_ref)
+                dt_str = getattr(img, 'datetime_original', None)
+                dt_obj = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S') if dt_str else datetime.fromtimestamp(file.last_modified)
+                raw_data.append({
+                    "Arquivo": file.name, "Lat": lat, "Lon": lon, "Time": dt_obj,
+                    "GMS": f"{dd_to_gms(lat, True)}, {dd_to_gms(lon, False)}"
+                })
+        except: continue
+
+    if raw_data:
+        # 1. Ordenação e Filtragem com Ponto Final Obrigatório
+        df_all = pd.DataFrame(raw_data).sort_values(by='Time')
+        filtered = [df_all.iloc[0].to_dict()]
         
-        if v == 0:
-            return 'http://maps.google.com/mapfiles/kml/paddle/blu-circle.png', "0% (Não Iniciada)"
-        elif v <= 0.8:
-            return 'http://maps.google.com/mapfiles/kml/paddle/ylw-circle.png', f"{v*100:.1f}% (Em Andamento)"
-        else:
-            return 'http://maps.google.com/mapfiles/kml/paddle/red-circle.png', f"{v*100:.1f}% (Fase Final/Concluída)"
-    except:
-        return 'http://maps.google.com/mapfiles/kml/paddle/wht-circle.png', "Dado Inválido"
-
-geolocator = ArcGIS(timeout=10)
-
-uploaded_file = st.file_uploader("Suba sua planilha Excel", type=['xlsx', 'xls'])
-
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    cols_detectadas = detectar_colunas(df.columns)
-    
-    # Interface Lateral para Ajustes e Filtros
-    st.sidebar.header("⚙️ Configurações")
-    c_conv = st.sidebar.text_input("Coluna Nº Convênio", cols_detectadas.get('convenio', ''))
-    c_mun = st.sidebar.text_input("Coluna Município", cols_detectadas.get('municipio', ''))
-    c_uf = st.sidebar.text_input("Coluna UF", cols_detectadas.get('uf', ''))
-    c_perc = st.sidebar.text_input("Coluna Execução", cols_detectadas.get('percentual', ''))
-
-    if c_uf in df.columns:
-        ufs_disponiveis = sorted(df[c_uf].dropna().unique().tolist())
-        ufs_selecionadas = st.multiselect("🌍 Filtrar por UF (Selecione uma ou mais)", ufs_disponiveis, default=ufs_disponiveis)
-        df_filtrado = df[df[c_uf].isin(ufs_selecionadas)]
-    else:
-        st.error("Coluna de UF não detectada. Verifique o nome na barra lateral.")
-        df_filtrado = pd.DataFrame()
-
-    if not df_filtrado.empty:
-        st.info(f"Registros selecionados após filtro: {len(df_filtrado)}")
+        for i in range(1, len(df_all) - 1):
+            last_p = filtered[-1]
+            curr_p = df_all.iloc[i]
+            if geodesic((last_p['Lat'], last_p['Lon']), (curr_p['Lat'], curr_p['Lon'])).meters >= raio_minimo:
+                filtered.append(curr_p.to_dict())
         
-        if st.button("🚀 Gerar Mapa Filtrado"):
-            kml = simplekml.Kml()
-            cache = {}
-            progress_bar = st.progress(0)
-            status_msg = st.empty()
+        # Inclusão obrigatória do último ponto
+        if len(df_all) > 1:
+            filtered.append(df_all.iloc[-1].to_dict())
+        
+        df_f = pd.DataFrame(filtered)
 
-            for i, (idx, row) in enumerate(df_filtrado.iterrows()):
-                progress_bar.progress((i + 1) / len(df_filtrado))
-                
-                mun_raw = str(row[c_mun]).strip() if c_mun in df.columns else ""
-                uf = str(row[c_uf]).strip().upper()
-                convenio = str(row[c_conv]).strip()
-                perc_val = row[c_perc] if c_perc in df.columns else 0
+        # 2. Cálculos de Distância para Excel e KML
+        dist_parcial = [0.0]
+        dist_acumulada = [0.0]
+        for i in range(1, len(df_f)):
+            d = geodesic((df_f.iloc[i-1]['Lat'], df_f.iloc[i-1]['Lon']), (df_f.iloc[i]['Lat'], df_f.iloc[i]['Lon'])).meters
+            dist_parcial.append(round(d, 2))
+            dist_acumulada.append(round(sum(dist_parcial) / 1000, 3))
+        
+        df_f['Dist_Parcial_m'] = dist_parcial
+        df_f['KM_Trecho'] = dist_acumulada
 
-                # Lógica de Localização (Município vs Capital)
-                is_estado = False
-                if mun_raw == "" or pd.isna(row[c_mun]) or "ESTADO DE" in mun_raw.upper() or mun_raw.upper() == "ESTADO":
-                    is_estado = True
-                    mun_limpo = CAPITAIS.get(uf, "Brasília")
-                    cabecalho = "🏢 CONVÊNIO COM O GOVERNO DO ESTADO"
-                else:
-                    mun_limpo = limpar_nome(mun_raw)
-                    cabecalho = f"🏙️ Município: {mun_raw}"
+        # --- LAYOUT DE RESULTADOS ---
+        st.markdown("---")
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f'<div class="metric-card">📸 Fotos<br><h2>{len(df_all)}</h2></div>', unsafe_allow_html=True)
+        c2.markdown(f'<div class="metric-card">📍 Pontos KML<br><h2>{len(df_f)}</h2></div>', unsafe_allow_html=True)
+        c3.markdown(f'<div class="metric-card">🛣️ Extensão<br><h2>{df_f["KM_Trecho"].max()} km</h2></div>', unsafe_allow_html=True)
 
-                query = f"{mun_limpo}, {uf}, Brasil"
-                status_msg.text(f"Geocodificando ({i+1}/{len(df_filtrado)}): {query}")
+        st.markdown("---")
+        col_map, col_down = st.columns([2, 1])
 
-                if query in cache:
-                    location = cache[query]
-                else:
-                    try:
-                        location = geolocator.geocode(query)
-                        cache[query] = location
-                    except: location = None
-
-                if location:
-                    pnt = kml.newpoint(name=convenio)
-                    pnt.coords = [(location.longitude, location.latitude)]
-                    icon_url, perc_texto = obter_estilo_execucao(perc_val)
-                    
-                    pnt.description = (
-                        f"<b>{cabecalho}</b><br><br>"
-                        f"<b>UF:</b> {uf}<br>"
-                        f"<b>Nº Convênio:</b> {convenio}<br>"
-                        f"<b>Status de Execução:</b> {perc_texto}"
-                    )
-                    pnt.style.iconstyle.icon.href = icon_url
+        with col_down:
+            st.subheader("📥 Downloads")
             
-            status_msg.empty()
-            st.success(f"Mapa gerado com {len(df_filtrado)} pontos!")
-            st.download_button("💾 BAIXAR KML FILTRADO", kml.kml(), f"mapa_convenios_{len(ufs_selecionadas)}UFs.kml")
+            # Gerar Excel
+            output_excel = io.BytesIO()
+            with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                df_f.to_excel(writer, index=False, sheet_name='Relatorio_Vistoria')
+            st.download_button("📊 Baixar Relatório Excel", output_excel.getvalue(), "relatorio_vistoria.xlsx")
+
+            # Gerar KML
+            kml = simplekml.Kml()
+            ponto_coords = []
+            for i, row in df_f.iterrows():
+                # Lógica de Nomeação
+                if i == 0:
+                    nome = f"Início do trecho - {row['GMS']}"
+                elif i == len(df_f) - 1:
+                    nome = f"Final do trecho - {row['GMS']}"
+                else:
+                    nome = row['GMS']
+                
+                pnt = kml.newpoint(name=nome, coords=[(row['Lon'], row['Lat'])])
+                pnt.description = f"Foto km {row['KM_Trecho']}\nArquivo: {row['Arquivo']}\nData: {row['Time']}"
+                ponto_coords.append((row['Lat'], row['Lon']))
+
+            if seguir_estradas:
+                with st.spinner("Traçando rota por estradas..."):
+                    rota_kml = get_road_route(ponto_coords)
+            else:
+                rota_kml = ponto_coords
+
+            lin = kml.newlinestring(name="Eixo da Vistoria", coords=[(p[1], p[0]) for p in rota_kml])
+            lin.style.linestyle.color = simplekml.Color.blue
+            lin.style.linestyle.width = 4
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
+                kml.save(tmp.name)
+                with open(tmp.name, 'rb') as f:
+                    st.download_button("🗺️ Baixar Arquivo KML", f, "vistoria_trecho.kml")
+                os.unlink(tmp.name)
+
+        with col_map:
+            m = folium.Map(location=[df_f['Lat'].mean(), df_f['Lon'].mean()], zoom_start=13, tiles="cartodbpositron")
+            folium.PolyLine(rota_kml, color="#007bff", weight=4).add_to(m)
+            for i, row in df_f.iterrows():
+                folium.Marker([row['Lat'], row['Lon']], popup=f"KM {row['KM_Trecho']}").add_to(m)
+            folium_static(m, width=700)
