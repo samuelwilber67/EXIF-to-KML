@@ -9,200 +9,169 @@ from geopy.distance import geodesic
 import tempfile
 import os
 import requests
+import io
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(
     page_title="Vistoria KML Pro",
     page_icon="📍",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# --- ESTILIZAÇÃO CUSTOMIZADA (CSS) ---
+# --- ESTILIZAÇÃO CUSTOMIZADA ---
 st.markdown("""
     <style>
-    .main {
-        background-color: #f8f9fa;
-    }
-    .stButton>button {
-        width: 100%;
-        border-radius: 5px;
-        height: 3em;
-        background-color: #007bff;
-        color: white;
-    }
-    .reportview-container .main .block-container {
-        padding-top: 2rem;
-    }
+    .main { background-color: #f8f9fa; }
     .metric-card {
         background-color: white;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-        border-left: 5px solid #007bff;
+        padding: 20px;
+        border-radius: 12px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        border-top: 4px solid #007bff;
+        text-align: center;
+    }
+    .stDownloadButton > button {
+        width: 100%;
+        background-color: #28a745;
+        color: white;
     }
     </style>
     """, unsafe_allow_html=True)
 
-# --- FUNÇÕES AUXILIARES ---
-
-def get_road_route(points):
-    """Obtém a rota seguindo estradas reais via API OSRM."""
-    if len(points) < 2:
-        return points
-    
-    # Formata as coordenadas para a API (lon,lat;lon,lat)
-    coords_str = ";".join([f"{p[1]},{p[0]}" for p in points])
-    url = f"http://router.project-osrm.org/route/v1/driving/{coords_str}?overview=full&geometries=geojson"
-    
-    try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data.get("code") == "Ok":
-            # Retorna a lista de coordenadas da estrada [lat, lon]
-            return [[c[1], c[0]] for c in data["routes"][0]["geometry"]["coordinates"]]
-    except:
-        pass
-    return points # Fallback para linha reta em caso de erro
+# --- FUNÇÕES TÉCNICAS ---
 
 def dms_to_dd(dms, ref):
-    degrees = dms[0]
-    minutes = dms[1]
-    seconds = dms[2]
-    dd = degrees + (minutes / 60) + (seconds / 3600)
-    if ref in ['S', 'W']:
-        dd = -dd
-    return dd
+    dd = dms[0] + (dms[1] / 60) + (dms[2] / 3600)
+    return -dd if ref in ['S', 'W'] else dd
 
 def dd_to_gms(decimal, is_lat):
-    abs_decimal = abs(decimal)
-    degrees = int(abs_decimal)
-    minutes_full = (abs_decimal - degrees) * 60
-    minutes = int(minutes_full)
-    seconds = round((minutes_full - minutes) * 60, 2)
-    direction = ('N' if decimal >= 0 else 'S') if is_lat else ('E' if decimal >= 0 else 'W')
-    return f"{degrees}°{minutes}'{seconds}\"{direction}"
+    abs_d = abs(decimal)
+    d = int(abs_d)
+    m = int((abs_d - d) * 60)
+    s = round((((abs_d - d) * 60) - m) * 60, 2)
+    dir = ('N' if decimal >= 0 else 'S') if is_lat else ('E' if decimal >= 0 else 'W')
+    return f"{d}°{m}'{s}\"{dir}"
 
-# --- CABEÇALHO ---
+def get_road_route(points):
+    if len(points) < 2: return points
+    coords = ";".join([f"{p[1]},{p[0]}" for p in points])
+    url = f"http://router.project-osrm.org/route/v1/driving/{coords}?overview=full&geometries=geojson"
+    try:
+        r = requests.get(url, timeout=10).json()
+        if r.get("code") == "Ok":
+            return [[c[1], c[0]] for c in r["routes"][0]["geometry"]["coordinates"]]
+    except: pass
+    return points
+
+# --- INTERFACE ---
 st.title("📑 Geração de Arquivo KML a Partir das Fotos da Vistoria")
-st.info("Esta ferramenta processa fotos georreferenciadas, otimiza a densidade de pontos e traça rotas por estradas existentes.")
 
-# --- SIDEBAR ---
 with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/854/854878.png", width=100)
-    st.header("Painel de Controle")
-    
-    raio_minimo = st.slider(
-        "Distância mínima entre fotos (m)", 
-        0, 5000, 100, 50,
-        help="Pontos muito próximos serão ignorados para limpar o trajeto."
-    )
-    
-    st.markdown("---")
-    st.markdown("### Configurações de Rota")
-    seguir_estradas = st.toggle("Seguir estradas existentes", value=True, help="Usa inteligência de mapas para traçar o caminho por ruas e rodovias.")
-    
-    st.markdown("---")
-    st.caption("Desenvolvido para vistorias técnicas e engenharia.")
+    st.header("⚙️ Configurações")
+    raio_minimo = st.slider("Raio de Otimização (m)", 0, 5000, 100, 50)
+    seguir_estradas = st.toggle("Seguir estradas reais", value=True)
+    st.info("O último ponto da sequência é sempre incluído obrigatoriamente.")
 
-# --- CONTEÚDO PRINCIPAL ---
-uploaded_files = st.file_uploader("Selecione ou arraste as fotos da vistoria", type=['jpg', 'jpeg'], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload das fotos da vistoria", type=['jpg', 'jpeg'], accept_multiple_files=True)
 
 if uploaded_files:
     raw_data = []
-    
-    with st.spinner("Extraindo metadados EXIF..."):
-        for file in uploaded_files:
-            try:
-                img = Image(file)
-                if img.has_exif and hasattr(img, 'gps_latitude'):
-                    lat = dms_to_dd(img.gps_latitude, img.gps_latitude_ref)
-                    lon = dms_to_dd(img.gps_longitude, img.gps_longitude_ref)
-                    dt_str = getattr(img, 'datetime_original', None)
-                    dt_obj = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S') if dt_str else datetime.fromtimestamp(file.last_modified)
-                    
-                    raw_data.append({
-                        "Arquivo": file.name,
-                        "Latitude": lat,
-                        "Longitude": lon,
-                        "Timestamp": dt_obj,
-                        "GMS": f"{dd_to_gms(lat, True)}, {dd_to_gms(lon, False)}"
-                    })
-            except:
-                continue
+    for file in uploaded_files:
+        try:
+            img = Image(file)
+            if img.has_exif and hasattr(img, 'gps_latitude'):
+                lat = dms_to_dd(img.gps_latitude, img.gps_latitude_ref)
+                lon = dms_to_dd(img.gps_longitude, img.gps_longitude_ref)
+                dt_str = getattr(img, 'datetime_original', None)
+                dt_obj = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S') if dt_str else datetime.fromtimestamp(file.last_modified)
+                raw_data.append({
+                    "Arquivo": file.name, "Lat": lat, "Lon": lon, "Time": dt_obj,
+                    "GMS": f"{dd_to_gms(lat, True)}, {dd_to_gms(lon, False)}"
+                })
+        except: continue
 
     if raw_data:
-        # Ordenação e Filtragem
-        df_full = pd.DataFrame(raw_data).sort_values(by='Timestamp')
-        filtered_points = []
-        if not df_full.empty:
-            last_p = df_full.iloc[0]
-            filtered_points.append(last_p)
-            for i in range(1, len(df_full)):
-                curr_p = df_full.iloc[i]
-                if geodesic((last_p['Latitude'], last_p['Longitude']), (curr_p['Latitude'], curr_p['Longitude'])).meters >= raio_minimo:
-                    filtered_points.append(curr_p)
-                    last_p = curr_p
+        # 1. Ordenação e Filtragem com Ponto Final Obrigatório
+        df_all = pd.DataFrame(raw_data).sort_values(by='Time')
+        filtered = [df_all.iloc[0].to_dict()]
         
-        df_filtered = pd.DataFrame(filtered_points)
+        for i in range(1, len(df_all) - 1):
+            last_p = filtered[-1]
+            curr_p = df_all.iloc[i]
+            if geodesic((last_p['Lat'], last_p['Lon']), (curr_p['Lat'], curr_p['Lon'])).meters >= raio_minimo:
+                filtered.append(curr_p.to_dict())
+        
+        # Inclusão obrigatória do último ponto
+        if len(df_all) > 1:
+            filtered.append(df_all.iloc[-1].to_dict())
+        
+        df_f = pd.DataFrame(filtered)
 
-        # Métricas Modernas
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            st.markdown(f'<div class="metric-card"><b>Total de Fotos</b><br><h2>{len(df_full)}</h2></div>', unsafe_allow_html=True)
-        with m2:
-            st.markdown(f'<div class="metric-card"><b>Pontos Filtrados</b><br><h2>{len(df_filtered)}</h2></div>', unsafe_allow_html=True)
-        with m3:
-            reducao = (1 - len(df_filtered)/len(df_full))*100
-            st.markdown(f'<div class="metric-card"><b>Otimização</b><br><h2>{reducao:.1f}%</h2></div>', unsafe_allow_html=True)
+        # 2. Cálculos de Distância para Excel e KML
+        dist_parcial = [0.0]
+        dist_acumulada = [0.0]
+        for i in range(1, len(df_f)):
+            d = geodesic((df_f.iloc[i-1]['Lat'], df_f.iloc[i-1]['Lon']), (df_f.iloc[i]['Lat'], df_f.iloc[i]['Lon'])).meters
+            dist_parcial.append(round(d, 2))
+            dist_acumulada.append(round(sum(dist_parcial) / 1000, 3))
+        
+        df_f['Dist_Parcial_m'] = dist_parcial
+        df_f['KM_Trecho'] = dist_acumulada
+
+        # --- LAYOUT DE RESULTADOS ---
+        st.markdown("---")
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(f'<div class="metric-card">📸 Fotos<br><h2>{len(df_all)}</h2></div>', unsafe_allow_html=True)
+        c2.markdown(f'<div class="metric-card">📍 Pontos KML<br><h2>{len(df_f)}</h2></div>', unsafe_allow_html=True)
+        c3.markdown(f'<div class="metric-card">🛣️ Extensão<br><h2>{df_f["KM_Trecho"].max()} km</h2></div>', unsafe_allow_html=True)
 
         st.markdown("---")
+        col_map, col_down = st.columns([2, 1])
 
-        c1, c2 = st.columns([1, 2])
-
-        with c1:
-            st.subheader("📋 Relatório de Pontos")
-            st.dataframe(df_filtered[['Timestamp', 'GMS']], use_container_width=True, height=400)
+        with col_down:
+            st.subheader("📥 Downloads")
             
-            # Processamento da Rota
-            ponto_coords = [(row['Latitude'], row['Longitude']) for _, row in df_filtered.iterrows()]
-            
-            if seguir_estradas:
-                with st.spinner("Calculando rota por estradas..."):
-                    rota_final = get_road_route(ponto_coords)
-            else:
-                rota_final = ponto_coords
+            # Gerar Excel
+            output_excel = io.BytesIO()
+            with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                df_f.to_excel(writer, index=False, sheet_name='Relatorio_Vistoria')
+            st.download_button("📊 Baixar Relatório Excel", output_excel.getvalue(), "relatorio_vistoria.xlsx")
 
-            # Geração do KML
+            # Gerar KML
             kml = simplekml.Kml()
-            for _, row in df_filtered.iterrows():
-                pnt = kml.newpoint(name=row['GMS'], coords=[(row['Longitude'], row['Latitude'])])
-                pnt.description = f"Vistoria: {row['Arquivo']}\nData: {row['Timestamp']}"
-            
-            if len(rota_final) > 1:
-                lin = kml.newlinestring(name="Caminho da Vistoria")
-                lin.coords = [(p[1], p[0]) for p in rota_final]
-                lin.style.linestyle.color = simplekml.Color.blue
-                lin.style.linestyle.width = 4
+            ponto_coords = []
+            for i, row in df_f.iterrows():
+                # Lógica de Nomeação
+                if i == 0:
+                    nome = f"Início do trecho - {row['GMS']}"
+                elif i == len(df_f) - 1:
+                    nome = f"Final do trecho - {row['GMS']}"
+                else:
+                    nome = row['GMS']
+                
+                pnt = kml.newpoint(name=nome, coords=[(row['Lon'], row['Lat'])])
+                pnt.description = f"Foto km {row['KM_Trecho']}\nArquivo: {row['Arquivo']}\nData: {row['Time']}"
+                ponto_coords.append((row['Lat'], row['Lon']))
+
+            if seguir_estradas:
+                with st.spinner("Traçando rota por estradas..."):
+                    rota_kml = get_road_route(ponto_coords)
+            else:
+                rota_kml = ponto_coords
+
+            lin = kml.newlinestring(name="Eixo da Vistoria", coords=[(p[1], p[0]) for p in rota_kml])
+            lin.style.linestyle.color = simplekml.Color.blue
+            lin.style.linestyle.width = 4
 
             with tempfile.NamedTemporaryFile(delete=False, suffix='.kml') as tmp:
                 kml.save(tmp.name)
                 with open(tmp.name, 'rb') as f:
-                    st.download_button("🚀 Baixar Arquivo KML Final", f, "vistoria_estrada.kml", use_container_width=True)
+                    st.download_button("🗺️ Baixar Arquivo KML", f, "vistoria_trecho.kml")
                 os.unlink(tmp.name)
 
-        with c2:
-            st.subheader("🗺️ Mapa Interativo")
-            m = folium.Map(location=[df_filtered['Latitude'].mean(), df_filtered['Longitude'].mean()], zoom_start=13, tiles="cartodbpositron")
-            
-            # Desenha a rota (estrada ou reta)
-            folium.PolyLine(rota_final, color="#007bff", weight=5, opacity=0.7).add_to(m)
-            
-            for _, row in df_filtered.iterrows():
-                folium.CircleMarker(
-                    [row['Latitude'], row['Longitude']],
-                    radius=6, color="#007bff", fill=True, fill_color="#ffffff",
-                    popup=row['GMS']
-                ).add_to(m)
-            
-            folium_static(m, width=800)
+        with col_map:
+            m = folium.Map(location=[df_f['Lat'].mean(), df_f['Lon'].mean()], zoom_start=13, tiles="cartodbpositron")
+            folium.PolyLine(rota_kml, color="#007bff", weight=4).add_to(m)
+            for i, row in df_f.iterrows():
+                folium.Marker([row['Lat'], row['Lon']], popup=f"KM {row['KM_Trecho']}").add_to(m)
+            folium_static(m, width=700)
