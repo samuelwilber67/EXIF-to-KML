@@ -4,3 +4,4 @@ simplekml
 folium
 streamlit-folium
 pandas
+geopy
